@@ -1,0 +1,151 @@
+name: Build and publish a release
+
+# Builds the installers from the private JamesKLadd/gui-tennis source and publishes them here, where
+# installed apps look for updates. Public repositories run Actions without a minutes allowance.
+# Run it from Actions → "Build and publish a release" → Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, like 1.2.1 (no v)"
+        required: true
+      ref:
+        description: "gui-tennis branch, tag or commit to build"
+        required: true
+        default: main
+      notes:
+        description: "Release notes (leave empty to list the commits since the last release)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.version }}
+
+env:
+  SOURCE: JamesKLadd/gui-tennis
+
+jobs:
+  check:
+    name: Check the version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Version must look like 1.2.3 and not go backwards
+        env:
+          VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+          HAS_SOURCE_TOKEN: ${{ secrets.SOURCE_TOKEN != '' }}
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::The version must look like 1.2.3 (got '$VERSION')."; exit 1
+          fi
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          latest="${latest#v}"
+          if [ -n "$latest" ] && [ "$latest" != "$VERSION" ] && [ "$(printf '%s\n%s\n' "$latest" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+            echo "::error::$VERSION is older than the latest release ($latest); installed apps would never be offered it."; exit 1
+          fi
+          if [ "$HAS_SOURCE_TOKEN" != "true" ]; then
+            echo "::error::Add the SOURCE_TOKEN secret (read access to $SOURCE) under Settings → Secrets and variables → Actions."; exit 1
+          fi
+
+  installers:
+    name: Test and build (${{ matrix.os }})
+    needs: check
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Stamp the version
+        # The app compares this with the release tag, and the MSI only upgrades to a higher version.
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version }}
+        run: printf '%s\n' "$VERSION" > VERSION
+      - name: Install fakeroot for the .deb
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y fakeroot
+      - name: Make sure WiX Toolset 3 is available for the .msi
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $found = (Get-Command candle.exe -ErrorAction SilentlyContinue) -or (Get-Item "${env:ProgramFiles(x86)}\WiX Toolset v3*\bin" -ErrorAction SilentlyContinue)
+          if (-not $found) { choco install wixtoolset --version 3.14.1 --no-progress -y }
+      - name: Run every test suite, then build the installers (build.sh)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./build.sh --test --package
+      - name: Run every test suite, then build the installers (build.ps1)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\build.ps1 -Test -Package
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installers-${{ runner.os }}
+          path: |
+            build/installers/*.msi
+            build/installers/*.zip
+            build/installers/*.dmg
+            build/installers/*.deb
+            build/installers/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish v${{ inputs.version }}
+    needs: installers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ env.SOURCE }}
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+          path: source
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: installers
+      - name: Write the release notes
+        env:
+          NOTES: ${{ inputs.notes }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -n "$NOTES" ]; then printf '%s\n' "$NOTES" > notes.md; exit 0; fi
+          previous=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          {
+            echo "## What's new"
+            if [ -n "$previous" ] && git -C source rev-parse -q --verify "refs/tags/$previous" > /dev/null; then
+              git -C source log --no-merges --reverse --pretty='- %s' "$previous..HEAD"
+            else
+              git -C source log --no-merges --reverse --pretty='- %s' -n 20
+            fi
+          } > notes.md
+          cat notes.md
+      - name: Attach the installers, creating the release if needed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ inputs.version }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" installers/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" installers/* --repo "$GITHUB_REPOSITORY" --target main \
+              --title "ATP Tennis Simulator $TAG" --notes-file notes.md --latest
+          fi
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | "\(.name)  \(.digest // "no checksum")"'
